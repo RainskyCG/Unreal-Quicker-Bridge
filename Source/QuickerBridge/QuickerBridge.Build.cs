@@ -29,6 +29,8 @@ public class QuickerBridge : ModuleRules
             "GraphEditor", 
             "LevelEditor",
             "ContentBrowser",
+            "ContentBrowserData",
+            "AssetRegistry",
             "AssetDefinition",
             "EditorWidgets",
             "ToolWidgets",

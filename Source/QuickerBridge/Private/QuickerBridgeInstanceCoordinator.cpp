@@ -278,4 +278,14 @@ namespace QuickerBridgeInstanceCoordinator
         }
 #endif
     }
+
+    bool IsRunning()
+    {
+        return bRunning.Load();
+    }
+
+    bool OwnsPort()
+    {
+        return bOwnsPortMutex;
+    }
 }

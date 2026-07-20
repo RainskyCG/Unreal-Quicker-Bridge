@@ -14,12 +14,27 @@ public:
     virtual FName GetCategoryName() const override { return FName("Plugins"); }
     virtual FName GetSectionName() const override { return FName("QuickerBridge"); }
 
-    UPROPERTY(config, EditAnywhere, Category = "多 UE 实例", meta = (DisplayName = "启用多 UE 实例端口切换", ToolTip = "启用后，不同 Unreal Editor 进程成为前台时会自动切换固定 HTTP 端口 18080。需要在所有同时运行的 UE 项目中启用，并重启编辑器。"))
+    UPROPERTY(VisibleAnywhere, Category = "HTTP Service", meta = (DisplayName = "UE Service Address", ToolTip = "Local HTTP service exposed by QuickerBridge inside Unreal Editor."))
+    FString HttpServiceEndpoint = TEXT("http://127.0.0.1:18080");
+
+    UPROPERTY(VisibleAnywhere, Category = "HTTP Service", meta = (DisplayName = "Main Ports", MultiLine = true, ToolTip = "Port notes for local Quicker integration."))
+    FString PortSummary = TEXT("UE QuickerBridge: 127.0.0.1:18080 for UE context probing and Python execution.\nBlender QuickerBridge reference port: 127.0.0.1:18765, used only by the Blender add-on.\nWith multi-UE switching enabled, external tools still call 18080; the foreground UE instance owns that port.");
+
+    UPROPERTY(VisibleAnywhere, Category = "HTTP Service", meta = (DisplayName = "Context Endpoints", MultiLine = true, ToolTip = "Endpoints used by Quicker or other local tools to read the current UE context."))
+    FString ContextEndpointSummary = TEXT("GET /context/current: lightweight text context.\nGET /context/detail: structured JSON including context, graph, viewport, and Content Browser selection details.\nGET /context/debug: Slate widget path debug text.");
+
+    UPROPERTY(VisibleAnywhere, Category = "HTTP Service", meta = (DisplayName = "Action Endpoints", MultiLine = true, ToolTip = "Connectivity and local Python execution endpoints."))
+    FString ActionEndpointSummary = TEXT("GET /health: plugin status, port, process, Python initialization, route binding state.\nPOST /python/execute: JSON body with command, optional mode ExecuteFile, ExecuteStatement, or EvaluateStatement.");
+
+    UPROPERTY(VisibleAnywhere, Category = "Shortcuts", meta = (DisplayName = "Built-in Shortcuts", MultiLine = true, ToolTip = "Registered as Unreal Editor commands; defaults mirror the Blender add-on where practical."))
+    FString ShortcutSummary = TEXT("Ctrl+Alt+P: QuickerBridge probe, copies current /context/detail JSON to clipboard.\nCtrl+Alt+Shift+V: execute Unreal Python from clipboard.");
+
+    UPROPERTY(config, EditAnywhere, Category = "Multi UE Instances", meta = (DisplayName = "Enable Multi-UE Port Switching", ToolTip = "When enabled, Unreal Editor processes switch the fixed HTTP port 18080 as they become the foreground app. Enable in every simultaneously running UE project, then restart the editor."))
     bool bEnableMultiUEPortSwitching = false;
 
-    UPROPERTY(config, EditAnywhere, Category = "Scroll Lock 控制", meta = (DisplayName = "启用 Scroll Lock 视口控制", ToolTip = "启用后，鼠标位于当前 UE 实例的任意 3D 视口时解除 Scroll Lock，位于当前 UE 的其他区域时锁定 Scroll Lock。"))
+    UPROPERTY(config, EditAnywhere, Category = "Scroll Lock Control", meta = (DisplayName = "Enable Scroll Lock Viewport Control", ToolTip = "When enabled, Scroll Lock is released while the mouse is over any 3D viewport in the current UE instance and locked elsewhere in the current UE instance."))
     bool bEnableScrollLockViewportControl = true;
 
-    UPROPERTY(config, EditAnywhere, Category = "Scroll Lock 控制", meta = (DisplayName = "保底检测间隔", ToolTip = "鼠标移动时会立即检测；此间隔用于鼠标未移动或状态被外部修改时的保底检测。", ClampMin = "0.01", ClampMax = "2.0", UIMin = "0.01", UIMax = "1.0", ForceUnits = "s"))
+    UPROPERTY(config, EditAnywhere, Category = "Scroll Lock Control", meta = (DisplayName = "Fallback Detection Interval", ToolTip = "Mouse movement triggers immediate detection; this interval is a fallback for idle mouse state or external Scroll Lock changes.", ClampMin = "0.01", ClampMax = "2.0", UIMin = "0.01", UIMax = "1.0", ForceUnits = "s"))
     float ScrollLockDetectionInterval = 0.5f;
 };

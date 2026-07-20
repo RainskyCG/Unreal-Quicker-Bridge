@@ -1,8 +1,26 @@
-﻿#include "QuickerBridge.h"
+#include "QuickerBridge.h"
 #include "QuickerBridgeScrollLockController.h"
 #include "QuickerBridgeContextService.h"
 #include "QuickerBridgeInstanceCoordinator.h"
 #include "QuickerBridgeSettings.h"
+#include "AssetRegistry/AssetData.h"
+#include "Components/SceneComponent.h"
+#include "ContentBrowserItemPath.h"
+#include "ContentBrowserModule.h"
+#include "Engine/World.h"
+#include "Framework/Application/IInputProcessor.h"
+#include "Framework/Commands/Commands.h"
+#include "Framework/Commands/InputBindingManager.h"
+#include "Framework/Commands/InputChord.h"
+#include "Framework/Commands/UICommandList.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "HAL/PlatformApplicationMisc.h"
+#include "IContentBrowserSingleton.h"
+#include "InputCoreTypes.h"
+#include "Misc/EngineVersion.h"
+#include "Styling/AppStyle.h"
+#include "UObject/Package.h"
+#include "Widgets/Notifications/SNotificationList.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/SWindow.h"
@@ -40,10 +58,43 @@
 
 #define LOCTEXT_NAMESPACE "FQuickerBridgeModule"
 
+static constexpr int32 QuickerBridgeHttpPort = 18080;
+static const TCHAR* QuickerBridgeHttpHost = TEXT("127.0.0.1");
+static const TCHAR* QuickerBridgeProbeShortcut = TEXT("Ctrl+Alt+P");
+static const TCHAR* QuickerBridgeClipboardPythonShortcut = TEXT("Ctrl+Alt+Shift+V");
+
+static FHttpRouteHandle HealthRouteHandle;
 static FHttpRouteHandle GetContextRouteHandle;
 static FHttpRouteHandle GetContextDebugRouteHandle;
 static FHttpRouteHandle GetContextDetailRouteHandle;
 static FHttpRouteHandle ExecutePythonRouteHandle;
+static TSharedPtr<FUICommandList> QuickerBridgeCommandList;
+static TSharedPtr<IInputProcessor> QuickerBridgeInputProcessor;
+
+static FString GetHoveredContext();
+static TSharedRef<FJsonObject> GetHoveredContextDetail();
+
+class FQuickerBridgeCommands final : public TCommands<FQuickerBridgeCommands>
+{
+public:
+    FQuickerBridgeCommands()
+        : TCommands<FQuickerBridgeCommands>(
+            TEXT("QuickerBridge"),
+            NSLOCTEXT("Contexts", "QuickerBridge", "QuickerBridge"),
+            NAME_None,
+            FAppStyle::GetAppStyleSetName())
+    {
+    }
+
+    virtual void RegisterCommands() override
+    {
+        UI_COMMAND(RunContextProbe, "QuickerBridge Probe", "Copy the current QuickerBridge context detail to the clipboard.", EUserInterfaceActionType::Button, FInputChord(EModifierKey::Control | EModifierKey::Alt, EKeys::P));
+        UI_COMMAND(ExecuteClipboardPython, "Run Clipboard Python", "Execute Unreal Python code from the clipboard.", EUserInterfaceActionType::Button, FInputChord(EModifierKey::Control | EModifierKey::Alt | EModifierKey::Shift, EKeys::V));
+    }
+
+    TSharedPtr<FUICommandInfo> RunContextProbe;
+    TSharedPtr<FUICommandInfo> ExecuteClipboardPython;
+};
 
 static TUniquePtr<FHttpServerResponse> PrepareQuickerBridgeResponse(TUniquePtr<FHttpServerResponse> Response)
 {
@@ -60,15 +111,19 @@ static TUniquePtr<FHttpServerResponse> PrepareQuickerBridgeResponse(TUniquePtr<F
     return Response;
 }
 
-static TUniquePtr<FHttpServerResponse> CreateJsonResponse(
-    const TSharedRef<FJsonObject>& JsonObject,
-    EHttpServerResponseCodes ResponseCode = EHttpServerResponseCodes::Ok)
+static FString SerializeJsonObject(const TSharedRef<FJsonObject>& JsonObject)
 {
     FString JsonText;
     const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonText);
     FJsonSerializer::Serialize(JsonObject, Writer);
+    return JsonText;
+}
 
-    TUniquePtr<FHttpServerResponse> Response = FHttpServerResponse::Create(JsonText, TEXT("application/json; charset=utf-8"));
+static TUniquePtr<FHttpServerResponse> CreateJsonResponse(
+    const TSharedRef<FJsonObject>& JsonObject,
+    EHttpServerResponseCodes ResponseCode = EHttpServerResponseCodes::Ok)
+{
+    TUniquePtr<FHttpServerResponse> Response = FHttpServerResponse::Create(SerializeJsonObject(JsonObject), TEXT("application/json; charset=utf-8"));
     Response->Code = ResponseCode;
     return PrepareQuickerBridgeResponse(MoveTemp(Response));
 }
@@ -118,6 +173,185 @@ static TUniquePtr<FHttpServerResponse> ExecutePythonCommand(const FString& Comma
         bSuccess ? EHttpServerResponseCodes::Ok : EHttpServerResponseCodes::ServerError);
 }
 
+static void ShowQuickerBridgeNotification(const FText& Message, SNotificationItem::ECompletionState CompletionState)
+{
+    FNotificationInfo Info(Message);
+    Info.ExpireDuration = 3.0f;
+    Info.bUseSuccessFailIcons = true;
+
+    TSharedPtr<SNotificationItem> Notification = FSlateNotificationManager::Get().AddNotification(Info);
+    if (Notification.IsValid())
+    {
+        Notification->SetCompletionState(CompletionState);
+    }
+}
+
+static TSharedRef<FJsonObject> GetHealthPayload()
+{
+    const UQuickerBridgeSettings* Settings = GetDefault<UQuickerBridgeSettings>();
+    IPythonScriptPlugin* PythonPlugin = IPythonScriptPlugin::Get();
+    const bool bMultiUESwitchingEnabled = Settings && Settings->bEnableMultiUEPortSwitching;
+
+    const TSharedRef<FJsonObject> JsonObject = MakeShared<FJsonObject>();
+    JsonObject->SetBoolField(TEXT("ok"), true);
+    JsonObject->SetStringField(TEXT("service"), TEXT("QuickerBridge"));
+    JsonObject->SetStringField(TEXT("project"), FApp::GetProjectName());
+    JsonObject->SetNumberField(TEXT("processId"), FPlatformProcess::GetCurrentProcessId());
+    JsonObject->SetStringField(TEXT("engineVersion"), FEngineVersion::Current().ToString());
+    JsonObject->SetStringField(TEXT("host"), QuickerBridgeHttpHost);
+    JsonObject->SetNumberField(TEXT("httpPort"), QuickerBridgeHttpPort);
+    JsonObject->SetStringField(TEXT("baseUrl"), FString::Printf(TEXT("http://%s:%d"), QuickerBridgeHttpHost, QuickerBridgeHttpPort));
+    JsonObject->SetBoolField(TEXT("pythonInitialized"), PythonPlugin && PythonPlugin->IsPythonInitialized());
+    JsonObject->SetBoolField(TEXT("supportsClipboardPython"), true);
+    JsonObject->SetBoolField(TEXT("multiUEPortSwitchingEnabled"), bMultiUESwitchingEnabled);
+    JsonObject->SetBoolField(TEXT("multiUECoordinatorRunning"), QuickerBridgeInstanceCoordinator::IsRunning());
+    JsonObject->SetBoolField(TEXT("ownsHttpPort"), bMultiUESwitchingEnabled ? QuickerBridgeInstanceCoordinator::OwnsPort() : true);
+    JsonObject->SetStringField(TEXT("probeShortcut"), QuickerBridgeProbeShortcut);
+    JsonObject->SetStringField(TEXT("clipboardPythonShortcut"), QuickerBridgeClipboardPythonShortcut);
+
+    const TSharedRef<FJsonObject> RoutesObject = MakeShared<FJsonObject>();
+    RoutesObject->SetBoolField(TEXT("health"), HealthRouteHandle.IsValid());
+    RoutesObject->SetBoolField(TEXT("contextCurrent"), GetContextRouteHandle.IsValid());
+    RoutesObject->SetBoolField(TEXT("contextDetail"), GetContextDetailRouteHandle.IsValid());
+    RoutesObject->SetBoolField(TEXT("contextDebug"), GetContextDebugRouteHandle.IsValid());
+    RoutesObject->SetBoolField(TEXT("pythonExecute"), ExecutePythonRouteHandle.IsValid());
+    JsonObject->SetObjectField(TEXT("routesBound"), RoutesObject);
+
+    const TSharedRef<FJsonObject> EndpointsObject = MakeShared<FJsonObject>();
+    EndpointsObject->SetStringField(TEXT("health"), TEXT("GET /health"));
+    EndpointsObject->SetStringField(TEXT("contextCurrent"), TEXT("GET /context/current"));
+    EndpointsObject->SetStringField(TEXT("contextDetail"), TEXT("GET /context/detail"));
+    EndpointsObject->SetStringField(TEXT("contextDebug"), TEXT("GET /context/debug"));
+    EndpointsObject->SetStringField(TEXT("pythonExecute"), TEXT("POST /python/execute"));
+    JsonObject->SetObjectField(TEXT("endpoints"), EndpointsObject);
+
+    return JsonObject;
+}
+
+static void RunQuickerBridgeContextProbe()
+{
+    const TSharedRef<FJsonObject> Detail = GetHoveredContextDetail();
+    FPlatformApplicationMisc::ClipboardCopy(*SerializeJsonObject(Detail));
+
+    FString CurrentContext;
+    Detail->TryGetStringField(TEXT("current"), CurrentContext);
+    ShowQuickerBridgeNotification(
+        FText::Format(LOCTEXT("ContextProbeCopied", "QuickerBridge probe copied: {0}"), FText::FromString(CurrentContext)),
+        SNotificationItem::CS_Success);
+}
+
+static void RunQuickerBridgeClipboardPython()
+{
+    FString ClipboardText;
+    FPlatformApplicationMisc::ClipboardPaste(ClipboardText);
+    ClipboardText.TrimStartAndEndInline();
+
+    if (ClipboardText.IsEmpty())
+    {
+        ShowQuickerBridgeNotification(
+            LOCTEXT("ClipboardPythonEmpty", "Clipboard is empty."),
+            SNotificationItem::CS_Fail);
+        return;
+    }
+
+    TUniquePtr<FHttpServerResponse> Response = ExecutePythonCommand(ClipboardText, EPythonCommandExecutionMode::ExecuteFile);
+    const bool bSuccess = Response && Response->Code == EHttpServerResponseCodes::Ok;
+    ShowQuickerBridgeNotification(
+        bSuccess ? LOCTEXT("ClipboardPythonExecuted", "Clipboard Python executed.") : LOCTEXT("ClipboardPythonFailed", "Clipboard Python failed."),
+        bSuccess ? SNotificationItem::CS_Success : SNotificationItem::CS_Fail);
+}
+
+class FQuickerBridgeInputProcessor final : public IInputProcessor
+{
+public:
+    virtual void Tick(const float DeltaTime, FSlateApplication& SlateApp, TSharedRef<ICursor> Cursor) override
+    {
+    }
+
+    virtual bool HandleKeyDownEvent(FSlateApplication& SlateApp, const FKeyEvent& InKeyEvent) override
+    {
+        return QuickerBridgeCommandList.IsValid() && QuickerBridgeCommandList->ProcessCommandBindings(InKeyEvent);
+    }
+
+    virtual const TCHAR* GetDebugName() const override
+    {
+        return TEXT("QuickerBridgeInputProcessor");
+    }
+};
+
+static void RegisterQuickerBridgeEditorCommands()
+{
+    if (!FQuickerBridgeCommands::IsRegistered())
+    {
+        FQuickerBridgeCommands::Register();
+    }
+
+    if (!QuickerBridgeCommandList.IsValid())
+    {
+        QuickerBridgeCommandList = MakeShared<FUICommandList>();
+        const FQuickerBridgeCommands& Commands = FQuickerBridgeCommands::Get();
+        QuickerBridgeCommandList->MapAction(
+            Commands.RunContextProbe,
+            FExecuteAction::CreateStatic(&RunQuickerBridgeContextProbe));
+        QuickerBridgeCommandList->MapAction(
+            Commands.ExecuteClipboardPython,
+            FExecuteAction::CreateStatic(&RunQuickerBridgeClipboardPython));
+
+        FInputBindingManager::Get().RegisterCommandList(
+            FQuickerBridgeCommands::Get().GetContextName(),
+            QuickerBridgeCommandList.ToSharedRef());
+    }
+
+    if (!QuickerBridgeInputProcessor.IsValid() && FSlateApplication::IsInitialized())
+    {
+        QuickerBridgeInputProcessor = MakeShared<FQuickerBridgeInputProcessor>();
+        FSlateApplication::Get().RegisterInputPreProcessor(QuickerBridgeInputProcessor);
+    }
+}
+
+static void UnregisterQuickerBridgeEditorCommands()
+{
+    if (QuickerBridgeInputProcessor.IsValid())
+    {
+        if (FSlateApplication::IsInitialized())
+        {
+            FSlateApplication::Get().UnregisterInputPreProcessor(QuickerBridgeInputProcessor);
+        }
+        QuickerBridgeInputProcessor.Reset();
+    }
+
+    if (QuickerBridgeCommandList.IsValid())
+    {
+        if (FQuickerBridgeCommands::IsRegistered())
+        {
+            FInputBindingManager::Get().UnregisterCommandList(
+                FQuickerBridgeCommands::Get().GetContextName(),
+                QuickerBridgeCommandList.ToSharedRef());
+        }
+        QuickerBridgeCommandList.Reset();
+    }
+
+    if (FQuickerBridgeCommands::IsRegistered())
+    {
+        FQuickerBridgeCommands::Unregister();
+    }
+}
+
+static FString CleanContextToken(FString Value)
+{
+    Value.ReplaceInline(TEXT(" "), TEXT(""));
+    Value.ReplaceInline(TEXT("."), TEXT("_"));
+    Value.ReplaceInline(TEXT("/"), TEXT("_"));
+    Value.ReplaceInline(TEXT("\\"), TEXT("_"));
+    Value.ReplaceInline(TEXT("'"), TEXT(""));
+    Value.ReplaceInline(TEXT("\""), TEXT(""));
+    Value.ReplaceInline(TEXT(":"), TEXT("_"));
+    if (Value.EndsWith(TEXT("_C")))
+    {
+        Value.LeftChopInline(2);
+    }
+    return Value;
+}
 static bool GetMouseWindowVerticalInfo(const FWidgetPath& WidgetPath, const FVector2D& MousePos, float& OutLocalY, float& OutWindowHeight)
 {
     if (TSharedPtr<SWindow> TopWindow = WidgetPath.GetWindow())
@@ -426,6 +660,379 @@ static FString GetGraphSuffixFromGraphPanel(SGraphPanel* GraphPanel)
     return TEXT("");
 }
 
+static void ApplyEditorTypeFromGraphType(const FString& GraphType, FString& EditorType)
+{
+    if (GraphType == TEXT("Material")) EditorType = TEXT("Material");
+    else if (GraphType.StartsWith(TEXT("Anim"))) EditorType = TEXT("Animation");
+    else if (GraphType == TEXT("Niagara")) EditorType = TEXT("Niagara");
+    else if (GraphType == TEXT("MetaSound")) EditorType = TEXT("MetaSound");
+    else if (GraphType == TEXT("Widget")) EditorType = TEXT("Widget");
+    else if (GraphType == TEXT("BehaviorTree")) EditorType = TEXT("BehaviorTree");
+    else if (GraphType == TEXT("Rig")) EditorType = TEXT("ControlRig");
+}
+
+static TSharedRef<FJsonObject> MakeActorDetail(AActor* Actor)
+{
+    const TSharedRef<FJsonObject> ActorObject = MakeShared<FJsonObject>();
+    if (!Actor)
+    {
+        return ActorObject;
+    }
+
+    ActorObject->SetStringField(TEXT("name"), Actor->GetName());
+    ActorObject->SetStringField(TEXT("label"), Actor->GetActorLabel());
+    ActorObject->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+    ActorObject->SetStringField(TEXT("path"), Actor->GetPathName());
+
+    if (USceneComponent* RootComponent = Actor->GetRootComponent())
+    {
+        ActorObject->SetStringField(TEXT("rootComponentName"), RootComponent->GetName());
+        ActorObject->SetStringField(TEXT("rootComponentClass"), RootComponent->GetClass()->GetName());
+    }
+
+    return ActorObject;
+}
+
+static void AddActorSelectionDetail(
+    const TSharedRef<FJsonObject>& Detail,
+    const TArray<AActor*>& SelectedActors,
+    FString& Selection,
+    FString& SelectionObjectType)
+{
+    Detail->SetNumberField(TEXT("selectedActorCount"), SelectedActors.Num());
+
+    if (SelectedActors.Num() == 1 && SelectedActors[0])
+    {
+        Selection = TEXT("SingleActor");
+        SelectionObjectType = SelectedActors[0]->GetClass()->GetName();
+        Detail->SetStringField(TEXT("selectionObjectName"), SelectedActors[0]->GetName());
+        Detail->SetStringField(TEXT("selectionObjectLabel"), SelectedActors[0]->GetActorLabel());
+        Detail->SetStringField(TEXT("selectionObjectPath"), SelectedActors[0]->GetPathName());
+    }
+    else if (SelectedActors.Num() > 1)
+    {
+        Selection = TEXT("MultipleActors");
+    }
+
+    TArray<TSharedPtr<FJsonValue>> ActorEntries;
+    const int32 MaxActorsToReport = FMath::Min(SelectedActors.Num(), 16);
+    ActorEntries.Reserve(MaxActorsToReport);
+    for (int32 ActorIndex = 0; ActorIndex < MaxActorsToReport; ++ActorIndex)
+    {
+        if (SelectedActors[ActorIndex])
+        {
+            ActorEntries.Add(MakeShared<FJsonValueObject>(MakeActorDetail(SelectedActors[ActorIndex])));
+        }
+    }
+
+    Detail->SetArrayField(TEXT("selectedActors"), MoveTemp(ActorEntries));
+    Detail->SetBoolField(TEXT("selectedActorsTruncated"), SelectedActors.Num() > MaxActorsToReport);
+}
+
+static TSharedRef<FJsonObject> MakeAssetDataDetail(const FAssetData& AssetData)
+{
+    const TSharedRef<FJsonObject> AssetObject = MakeShared<FJsonObject>();
+    AssetObject->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
+    AssetObject->SetStringField(TEXT("assetClass"), AssetData.AssetClassPath.GetAssetName().ToString());
+    AssetObject->SetStringField(TEXT("packageName"), AssetData.PackageName.ToString());
+    AssetObject->SetStringField(TEXT("packagePath"), AssetData.PackagePath.ToString());
+    AssetObject->SetStringField(TEXT("objectPath"), AssetData.GetSoftObjectPath().ToString());
+    return AssetObject;
+}
+
+static void AddContentBrowserDetail(
+    const TSharedRef<FJsonObject>& Detail,
+    FString& Selection,
+    FString& SelectionObjectType)
+{
+    IContentBrowserSingleton& ContentBrowser = FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get();
+
+    const FContentBrowserItemPath CurrentPath = ContentBrowser.GetCurrentPath();
+    if (CurrentPath.HasInternalPath())
+    {
+        Detail->SetStringField(TEXT("contentBrowserPath"), CurrentPath.GetInternalPathString());
+    }
+    Detail->SetStringField(TEXT("contentBrowserVirtualPath"), CurrentPath.GetVirtualPathString());
+
+    TArray<FAssetData> SelectedAssets;
+    ContentBrowser.GetSelectedAssets(SelectedAssets);
+    TArray<FString> SelectedFolders;
+    ContentBrowser.GetSelectedFolders(SelectedFolders);
+
+    Detail->SetNumberField(TEXT("contentBrowserSelectedAssetCount"), SelectedAssets.Num());
+    Detail->SetNumberField(TEXT("contentBrowserSelectedFolderCount"), SelectedFolders.Num());
+
+    if (SelectedAssets.Num() == 1)
+    {
+        Selection = TEXT("SingleAsset");
+        SelectionObjectType = SelectedAssets[0].AssetClassPath.GetAssetName().ToString();
+        Detail->SetStringField(TEXT("selectionObjectName"), SelectedAssets[0].AssetName.ToString());
+        Detail->SetStringField(TEXT("selectionObjectPath"), SelectedAssets[0].GetSoftObjectPath().ToString());
+    }
+    else if (SelectedAssets.Num() > 1)
+    {
+        Selection = TEXT("MultipleAssets");
+    }
+    else if (SelectedFolders.Num() == 1)
+    {
+        Selection = TEXT("SingleFolder");
+        SelectionObjectType = TEXT("Folder");
+        Detail->SetStringField(TEXT("selectionObjectName"), SelectedFolders[0]);
+        Detail->SetStringField(TEXT("selectionObjectPath"), SelectedFolders[0]);
+    }
+    else if (SelectedFolders.Num() > 1)
+    {
+        Selection = TEXT("MultipleFolders");
+        SelectionObjectType = TEXT("Folder");
+    }
+
+    TArray<TSharedPtr<FJsonValue>> AssetEntries;
+    const int32 MaxAssetsToReport = FMath::Min(SelectedAssets.Num(), 16);
+    AssetEntries.Reserve(MaxAssetsToReport);
+    for (int32 AssetIndex = 0; AssetIndex < MaxAssetsToReport; ++AssetIndex)
+    {
+        AssetEntries.Add(MakeShared<FJsonValueObject>(MakeAssetDataDetail(SelectedAssets[AssetIndex])));
+    }
+    Detail->SetArrayField(TEXT("contentBrowserSelectedAssets"), MoveTemp(AssetEntries));
+    Detail->SetBoolField(TEXT("contentBrowserSelectedAssetsTruncated"), SelectedAssets.Num() > MaxAssetsToReport);
+
+    TArray<TSharedPtr<FJsonValue>> FolderEntries;
+    const int32 MaxFoldersToReport = FMath::Min(SelectedFolders.Num(), 16);
+    FolderEntries.Reserve(MaxFoldersToReport);
+    for (int32 FolderIndex = 0; FolderIndex < MaxFoldersToReport; ++FolderIndex)
+    {
+        FolderEntries.Add(MakeShared<FJsonValueString>(SelectedFolders[FolderIndex]));
+    }
+    Detail->SetArrayField(TEXT("contentBrowserSelectedFolders"), MoveTemp(FolderEntries));
+    Detail->SetBoolField(TEXT("contentBrowserSelectedFoldersTruncated"), SelectedFolders.Num() > MaxFoldersToReport);
+}
+
+static void AddViewportDetail(
+    const TSharedRef<FJsonObject>& Detail,
+    FEditorViewportClient* ViewportClient,
+    FString& Selection,
+    FString& SelectionObjectType)
+{
+    if (ViewportClient)
+    {
+        if (UWorld* World = ViewportClient->GetWorld())
+        {
+            Detail->SetStringField(TEXT("worldName"), World->GetName());
+            Detail->SetStringField(TEXT("worldPath"), World->GetPathName());
+            Detail->SetStringField(TEXT("worldType"), FString(LexToString(World->WorldType)));
+        }
+    }
+
+    if (GEditor)
+    {
+        if (UEditorActorSubsystem* EditorActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>())
+        {
+            AddActorSelectionDetail(Detail, EditorActorSubsystem->GetSelectedLevelActors(), Selection, SelectionObjectType);
+        }
+    }
+}
+
+static TSharedRef<FJsonObject> MakeGraphNodeDetail(UObject* NodeObject)
+{
+    const TSharedRef<FJsonObject> NodeObjectJson = MakeShared<FJsonObject>();
+    if (!NodeObject)
+    {
+        return NodeObjectJson;
+    }
+
+    NodeObjectJson->SetStringField(TEXT("name"), NodeObject->GetName());
+    NodeObjectJson->SetStringField(TEXT("class"), NodeObject->GetClass()->GetName());
+    NodeObjectJson->SetStringField(TEXT("type"), ParseGraphNodeName(NodeObject));
+    NodeObjectJson->SetStringField(TEXT("path"), NodeObject->GetPathName());
+
+    if (UK2Node_CallFunction* CallFunctionNode = Cast<UK2Node_CallFunction>(NodeObject))
+    {
+        NodeObjectJson->SetStringField(TEXT("nodeType"), TEXT("CallFunction"));
+        NodeObjectJson->SetStringField(TEXT("functionName"), CallFunctionNode->GetFunctionName().ToString());
+        if (UFunction* TargetFunction = CallFunctionNode->GetTargetFunction())
+        {
+            if (UClass* OwnerClass = TargetFunction->GetOwnerClass())
+            {
+                NodeObjectJson->SetStringField(TEXT("functionOwner"), OwnerClass->GetName());
+            }
+        }
+    }
+    else if (UK2Node_Literal* LiteralNode = Cast<UK2Node_Literal>(NodeObject))
+    {
+        NodeObjectJson->SetStringField(TEXT("nodeType"), TEXT("Literal"));
+        if (UObject* ObjectRef = LiteralNode->GetObjectRef())
+        {
+            NodeObjectJson->SetStringField(TEXT("literalObjectName"), ObjectRef->GetName());
+            NodeObjectJson->SetStringField(TEXT("literalObjectClass"), ObjectRef->GetClass()->GetName());
+            NodeObjectJson->SetStringField(TEXT("literalObjectPath"), ObjectRef->GetPathName());
+        }
+    }
+    else if (UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(NodeObject))
+    {
+        NodeObjectJson->SetStringField(TEXT("nodeType"), TEXT("MacroInstance"));
+        if (UEdGraph* MacroGraph = MacroNode->GetMacroGraph())
+        {
+            NodeObjectJson->SetStringField(TEXT("macroName"), MacroGraph->GetName());
+            NodeObjectJson->SetStringField(TEXT("macroPath"), MacroGraph->GetPathName());
+        }
+    }
+    else
+    {
+        NodeObjectJson->SetStringField(TEXT("nodeType"), ParseGraphNodeName(NodeObject));
+    }
+
+    return NodeObjectJson;
+}
+
+static void AddGraphPanelDetail(
+    const TSharedRef<FJsonObject>& Detail,
+    SGraphPanel* GraphPanel,
+    FString& GraphType,
+    FString& EditorType,
+    FString& Selection,
+    FString& SelectionObjectType,
+    FString& NodeType,
+    FString& FunctionName,
+    FString& FunctionOwner,
+    FString& NodeClass)
+{
+    if (!GraphPanel)
+    {
+        return;
+    }
+
+    const FString GraphSuffix = GetGraphSuffixFromGraphPanel(GraphPanel);
+    GraphType = GraphSuffix.StartsWith(TEXT("_")) ? GraphSuffix.RightChop(1) : GraphSuffix;
+    ApplyEditorTypeFromGraphType(GraphType, EditorType);
+
+    if (UEdGraph* GraphObject = GraphPanel->GetGraphObj())
+    {
+        Detail->SetStringField(TEXT("graphName"), GraphObject->GetName());
+        Detail->SetStringField(TEXT("graphClass"), GraphObject->GetClass()->GetName());
+        Detail->SetStringField(TEXT("graphPath"), GraphObject->GetPathName());
+        if (const UEdGraphSchema* Schema = GraphObject->GetSchema())
+        {
+            Detail->SetStringField(TEXT("graphSchema"), Schema->GetClass()->GetName());
+        }
+        if (UPackage* Package = GraphObject->GetOutermost())
+        {
+            Detail->SetBoolField(TEXT("graphPackageDirty"), Package->IsDirty());
+        }
+
+        bool bOwnerSet = false;
+        bool bAssetSet = false;
+        for (UObject* OuterObject = GraphObject->GetOuter(); OuterObject; OuterObject = OuterObject->GetOuter())
+        {
+            const FString OuterClass = OuterObject->GetClass()->GetName();
+            if (!bOwnerSet)
+            {
+                Detail->SetStringField(TEXT("graphOwnerName"), OuterObject->GetName());
+                Detail->SetStringField(TEXT("graphOwnerClass"), OuterClass);
+                Detail->SetStringField(TEXT("graphOwnerPath"), OuterObject->GetPathName());
+                bOwnerSet = true;
+            }
+
+            if (UBlueprint* Blueprint = Cast<UBlueprint>(OuterObject))
+            {
+                Detail->SetStringField(TEXT("blueprintName"), Blueprint->GetName());
+                Detail->SetStringField(TEXT("blueprintPath"), Blueprint->GetPathName());
+                if (Blueprint->ParentClass)
+                {
+                    Detail->SetStringField(TEXT("blueprintParentClass"), Blueprint->ParentClass->GetName());
+                }
+                if (Blueprint->GeneratedClass)
+                {
+                    Detail->SetStringField(TEXT("blueprintGeneratedClass"), Blueprint->GeneratedClass->GetName());
+                }
+                if (UPackage* BlueprintPackage = Blueprint->GetOutermost())
+                {
+                    Detail->SetBoolField(TEXT("blueprintDirty"), BlueprintPackage->IsDirty());
+                }
+            }
+
+            if (!bAssetSet &&
+                (OuterClass.Contains(TEXT("Material")) ||
+                 OuterClass.Contains(TEXT("Niagara")) ||
+                 OuterClass.Contains(TEXT("MetaSound")) ||
+                 OuterClass.Contains(TEXT("BehaviorTree")) ||
+                 OuterClass.Contains(TEXT("ControlRig"))))
+            {
+                Detail->SetStringField(TEXT("graphAssetName"), OuterObject->GetName());
+                Detail->SetStringField(TEXT("graphAssetClass"), OuterClass);
+                Detail->SetStringField(TEXT("graphAssetPath"), OuterObject->GetPathName());
+                bAssetSet = true;
+            }
+        }
+    }
+
+    const auto& SelectedNodes = GraphPanel->SelectionManager.SelectedNodes;
+    Detail->SetNumberField(TEXT("selectedNodeCount"), SelectedNodes.Num());
+
+    TArray<TSharedPtr<FJsonValue>> NodeEntries;
+    const int32 MaxNodesToReport = FMath::Min(SelectedNodes.Num(), 16);
+    NodeEntries.Reserve(MaxNodesToReport);
+
+    int32 NodeIndex = 0;
+    for (UObject* NodeObject : SelectedNodes)
+    {
+        if (!NodeObject)
+        {
+            continue;
+        }
+
+        if (NodeIndex < MaxNodesToReport)
+        {
+            NodeEntries.Add(MakeShared<FJsonValueObject>(MakeGraphNodeDetail(NodeObject)));
+        }
+        ++NodeIndex;
+
+        if (SelectedNodes.Num() == 1)
+        {
+            NodeClass = NodeObject->GetClass()->GetName();
+            SelectionObjectType = NodeClass;
+            if (UK2Node_CallFunction* CallFunctionNode = Cast<UK2Node_CallFunction>(NodeObject))
+            {
+                NodeType = TEXT("CallFunction");
+                FunctionName = CallFunctionNode->GetFunctionName().ToString();
+                if (UFunction* TargetFunction = CallFunctionNode->GetTargetFunction())
+                {
+                    if (UClass* OwnerClass = TargetFunction->GetOwnerClass())
+                    {
+                        FunctionOwner = OwnerClass->GetName();
+                    }
+                }
+            }
+            else if (Cast<UK2Node_Literal>(NodeObject))
+            {
+                NodeType = TEXT("Literal");
+            }
+            else if (UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(NodeObject))
+            {
+                NodeType = TEXT("MacroInstance");
+                if (UEdGraph* MacroGraph = MacroNode->GetMacroGraph())
+                {
+                    Detail->SetStringField(TEXT("macroName"), MacroGraph->GetName());
+                }
+            }
+            else
+            {
+                NodeType = ParseGraphNodeName(NodeObject);
+            }
+        }
+    }
+
+    Detail->SetArrayField(TEXT("selectedNodes"), MoveTemp(NodeEntries));
+    Detail->SetBoolField(TEXT("selectedNodesTruncated"), SelectedNodes.Num() > MaxNodesToReport);
+
+    if (SelectedNodes.Num() > 1)
+    {
+        Selection = TEXT("MultipleNodes");
+    }
+    else if (SelectedNodes.Num() == 1)
+    {
+        Selection = TEXT("SingleNode");
+    }
+}
 static FString GetLevelViewportPlaySessionSuffix()
 {
     if (!GEditor)
@@ -728,7 +1335,8 @@ static TSharedRef<FJsonObject> GetHoveredContextDetail()
         if (CurrentContext.StartsWith(TEXT("Viewport_Level")))
         {
             EditorType = TEXT("Level");
-            ViewMode = GetViewportContextViewMode(GetLevelViewportClientFromWidgetPath(WidgetPath));
+            FEditorViewportClient* LevelViewportClient = GetLevelViewportClientFromWidgetPath(WidgetPath);
+            ViewMode = GetViewportContextViewMode(LevelViewportClient);
             if (CurrentContext.Contains(TEXT("_PlayInEditor"))) PlayState = TEXT("PlayInEditor");
             else if (CurrentContext.Contains(TEXT("_SimulateInEditor"))) PlayState = TEXT("SimulateInEditor");
 
@@ -740,22 +1348,7 @@ static TSharedRef<FJsonObject> GetHoveredContextDetail()
             else if (CurrentContext.Contains(TEXT("_FractureMode"))) EditorMode = TEXT("FractureMode");
             else if (CurrentContext.Contains(TEXT("_AnimationMode"))) EditorMode = TEXT("AnimationMode");
 
-            if (GEditor)
-            {
-                if (UEditorActorSubsystem* EditorActorSubsystem = GEditor->GetEditorSubsystem<UEditorActorSubsystem>())
-                {
-                    const TArray<AActor*> SelectedActors = EditorActorSubsystem->GetSelectedLevelActors();
-                    if (SelectedActors.Num() == 1 && SelectedActors[0])
-                    {
-                        Selection = TEXT("SingleActor");
-                        SelectionObjectType = SelectedActors[0]->GetClass()->GetName();
-                    }
-                    else if (SelectedActors.Num() > 1)
-                    {
-                        Selection = TEXT("MultipleActors");
-                    }
-                }
-            }
+            AddViewportDetail(Detail, LevelViewportClient, Selection, SelectionObjectType);
         }
         else
         {
@@ -765,6 +1358,7 @@ static TSharedRef<FJsonObject> GetHoveredContextDetail()
     else if (CurrentContext.StartsWith(TEXT("ContentBrowser")))
     {
         Area = TEXT("ContentBrowser");
+        AddContentBrowserDetail(Detail, Selection, SelectionObjectType);
     }
 
     for (int32 WidgetIndex = WidgetPath.Widgets.Num() - 1; WidgetIndex >= 0; --WidgetIndex)
@@ -774,69 +1368,17 @@ static TSharedRef<FJsonObject> GetHoveredContextDetail()
             continue;
         }
 
-        SGraphPanel* GraphPanel = static_cast<SGraphPanel*>(&(WidgetPath.Widgets[WidgetIndex].Widget.Get()));
-        if (!GraphPanel)
-        {
-            break;
-        }
-
-        const FString GraphSuffix = GetGraphSuffixFromGraphPanel(GraphPanel);
-        GraphType = GraphSuffix.StartsWith(TEXT("_")) ? GraphSuffix.RightChop(1) : GraphSuffix;
-        if (GraphType == TEXT("Material")) EditorType = TEXT("Material");
-        else if (GraphType.StartsWith(TEXT("Anim"))) EditorType = TEXT("Animation");
-        else if (GraphType == TEXT("Niagara")) EditorType = TEXT("Niagara");
-        else if (GraphType == TEXT("MetaSound")) EditorType = TEXT("MetaSound");
-        else if (GraphType == TEXT("Widget")) EditorType = TEXT("Widget");
-        else if (GraphType == TEXT("BehaviorTree")) EditorType = TEXT("BehaviorTree");
-        else if (GraphType == TEXT("Rig")) EditorType = TEXT("ControlRig");
-
-        const auto& SelectedNodes = GraphPanel->SelectionManager.SelectedNodes;
-        if (SelectedNodes.Num() > 1)
-        {
-            Selection = TEXT("MultipleNodes");
-        }
-        else if (SelectedNodes.Num() == 1)
-        {
-            Selection = TEXT("SingleNode");
-            for (UObject* NodeObject : SelectedNodes)
-            {
-                if (!NodeObject)
-                {
-                    continue;
-                }
-
-                NodeClass = NodeObject->GetClass()->GetName();
-                if (UK2Node_CallFunction* CallFunctionNode = Cast<UK2Node_CallFunction>(NodeObject))
-                {
-                    NodeType = TEXT("CallFunction");
-                    FunctionName = CallFunctionNode->GetFunctionName().ToString();
-                    if (UFunction* TargetFunction = CallFunctionNode->GetTargetFunction())
-                    {
-                        if (UClass* OwnerClass = TargetFunction->GetOwnerClass())
-                        {
-                            FunctionOwner = OwnerClass->GetName();
-                        }
-                    }
-                }
-                else if (Cast<UK2Node_Literal>(NodeObject))
-                {
-                    NodeType = TEXT("Literal");
-                }
-                else if (UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(NodeObject))
-                {
-                    NodeType = TEXT("MacroInstance");
-                    if (UEdGraph* MacroGraph = MacroNode->GetMacroGraph())
-                    {
-                        Detail->SetStringField(TEXT("macroName"), MacroGraph->GetName());
-                    }
-                }
-                else
-                {
-                    NodeType = ParseGraphNodeName(NodeObject);
-                }
-            }
-        }
-
+        AddGraphPanelDetail(
+            Detail,
+            static_cast<SGraphPanel*>(&(WidgetPath.Widgets[WidgetIndex].Widget.Get())),
+            GraphType,
+            EditorType,
+            Selection,
+            SelectionObjectType,
+            NodeType,
+            FunctionName,
+            FunctionOwner,
+            NodeClass);
         break;
     }
 
@@ -865,6 +1407,7 @@ static TSharedRef<FJsonObject> GetHoveredContextDetail()
     AddTag(EditorType);
     AddTag(GraphType);
     AddTag(Selection);
+    AddTag(SelectionObjectType);
     AddTag(NodeType);
     AddTag(EditorMode);
     AddTag(PlayState);
@@ -932,13 +1475,19 @@ static FString GetHoveredContextDebug()
 
 void FQuickerBridgeModule::StartupModule()
 {
+    RegisterQuickerBridgeEditorCommands();
     QuickerBridgeScrollLockController::Start();
 
     FModuleManager::LoadModuleChecked<IModuleInterface>("HTTPServer");
-    TSharedPtr<IHttpRouter> HttpRouter = FHttpServerModule::Get().GetHttpRouter(18080);
+    TSharedPtr<IHttpRouter> HttpRouter = FHttpServerModule::Get().GetHttpRouter(QuickerBridgeHttpPort);
 
     if (HttpRouter.IsValid())
     {
+        if (HealthRouteHandle.IsValid())
+        {
+            HttpRouter->UnbindRoute(HealthRouteHandle);
+            HealthRouteHandle.Reset();
+        }
         if (GetContextRouteHandle.IsValid())
         {
             HttpRouter->UnbindRoute(GetContextRouteHandle);
@@ -960,6 +1509,19 @@ void FQuickerBridgeModule::StartupModule()
             ExecutePythonRouteHandle.Reset();
         }
 
+        HealthRouteHandle = HttpRouter->BindRoute(
+            FHttpPath(TEXT("/health")),
+            EHttpServerRequestVerbs::VERB_GET,
+            FHttpRequestHandler::CreateLambda([](const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
+            {
+                Async(EAsyncExecution::TaskGraphMainThread, [OnComplete]()
+                {
+                    OnComplete(CreateJsonResponse(GetHealthPayload()));
+                });
+                return true;
+            })
+        );
+        UE_LOG(LogTemp, Display, TEXT("QuickerBridge: /health route %s"), HealthRouteHandle.IsValid() ? TEXT("bound") : TEXT("failed"));
         GetContextRouteHandle = HttpRouter->BindRoute(
             FHttpPath(TEXT("/context/current")), 
             EHttpServerRequestVerbs::VERB_GET,
@@ -1068,18 +1630,25 @@ void FQuickerBridgeModule::StartupModule()
 
 void FQuickerBridgeModule::ShutdownModule()
 {
+    UnregisterQuickerBridgeEditorCommands();
     QuickerBridgeInstanceCoordinator::Stop();
     QuickerBridgeScrollLockController::Stop();
 
-    if (GetContextRouteHandle.IsValid() || GetContextDebugRouteHandle.IsValid() || GetContextDetailRouteHandle.IsValid() || ExecutePythonRouteHandle.IsValid())
+    if (HealthRouteHandle.IsValid() || GetContextRouteHandle.IsValid() || GetContextDebugRouteHandle.IsValid() || GetContextDetailRouteHandle.IsValid() || ExecutePythonRouteHandle.IsValid())
     {
         if (FModuleManager::Get().IsModuleLoaded("HTTPServer"))
         {
-            if (TSharedPtr<IHttpRouter> HttpRouter = FHttpServerModule::Get().GetHttpRouter(18080))
+            if (TSharedPtr<IHttpRouter> HttpRouter = FHttpServerModule::Get().GetHttpRouter(QuickerBridgeHttpPort))
             {
+                if (HealthRouteHandle.IsValid())
+                {
+                    HttpRouter->UnbindRoute(HealthRouteHandle);
+                    HealthRouteHandle.Reset();
+                }
                 if (GetContextRouteHandle.IsValid())
                 {
                     HttpRouter->UnbindRoute(GetContextRouteHandle);
+                    GetContextRouteHandle.Reset();
                 }
                 if (GetContextDebugRouteHandle.IsValid())
                 {
