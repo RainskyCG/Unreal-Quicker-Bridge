@@ -1,4 +1,4 @@
-# QuickerBridge
+# Unreal Quicker Bridge
 
 QuickerBridge 是一个仅用于 Unreal Editor 的桥接插件。它为 Quicker、Python 和其他本地自动化工具提供：
 
@@ -12,6 +12,19 @@ QuickerBridge 是一个仅用于 Unreal Editor 的桥接插件。它为 Quicker�
 
 本文档是插件的统一入口和长期记忆文件。**以后每次修改插件接口、HTTP API、行为、设置或关键架构时，必须同步更新本文档和末尾更新记录。**
 
+## 下载与安装
+
+配套项目：[Blender Quicker Bridge](https://github.com/RainskyCG/Blender-Quicker-Bridge)。两者分别适配各自软件，端口、上下文标签与 Python API 不通用。
+
+从 Releases 下载对应引擎版本的插件包，将其中的 `QuickerBridge` 放入 `<Project>/Plugins/`，启用插件及其 Python、Modeling Tools 依赖并重启编辑器。源码包需要自行编译；不同 UE 版本的二进制不能混用。
+
+本次发布提供 UE 5.8.3 Win64 构建，已通过完整编译、模块加载、HTTP 健康检查及 Python 执行验证。界面交互与多实例切换仍需实际场景回归；其他 UE 版本需重新编译验证。
+
+服务检查：`http://127.0.0.1:18080/health`。设置入口：`Editor Preferences > Plugins > QuickerBridge`。
+
+- `Ctrl+Alt+P`：复制鼠标所在区域的详细上下文 JSON。
+- `Ctrl+Alt+Shift+V`：执行剪贴板中的 Unreal Python；只运行来源可信的代码。
+
 ## 快速信息
 
 | 项目 | 当前值 |
@@ -21,7 +34,7 @@ QuickerBridge 是一个仅用于 Unreal Editor 的桥接插件。它为 Quicker�
 | 模块类型 | `Editor` |
 | 默认 HTTP 地址 | `http://127.0.0.1:18080` |
 | 主要 Python 类 | `unreal.QuickerBridgeLibrary` |
-| UE 版本 | 当前项目使用 UE 5.7 |
+| UE 版本 | UE 5.8.3 Win64 已通过编译和基础运行验证；开发工程使用 UE 5.7 |
 | 依赖插件 | `PythonScriptPlugin`、`ModelingToolsEditorMode` |
 | 编译目标 | `ModularHallwayEditor Win64 Development` |
 
@@ -44,6 +57,7 @@ QuickerBridge 是一个仅用于 Unreal Editor 的桥接插件。它为 Quicker�
 | 方法 | 完整地址 | 功能 |
 |---|---|---|
 | `GET` | `http://127.0.0.1:18080/context/current` | 返回鼠标所在区域的简洁上下文字符串。 |
+| `GET` | `http://127.0.0.1:18080/health` | 返回引擎版本、进程、端口、Python 初始化和路由绑定状态。 |
 | `GET` | `http://127.0.0.1:18080/context/detail` | 返回结构化上下文 JSON，包含区域、图表、选择、节点和函数信息。 |
 | `GET` | `http://127.0.0.1:18080/context/debug` | 返回 Slate 路径、窗口和鼠标位置等调试信息。 |
 | `POST` / `PUT` | `http://127.0.0.1:18080/python/execute` | 在 UE 主线程执行 Unreal Python。 |
@@ -419,6 +433,13 @@ Result: Succeeded
 - `force_set_editor_property` 能绕过常规 UI 限制，应谨慎使用。
 
 ## 更新记录
+
+### v1.0.0 / 2026-10-05
+
+- 整理首次公开发布的安装说明和 UE 5.8.3 Win64 验证范围。
+- 提供健康检查、设置面板端口说明、上下文探针和剪贴板 Python 快捷键。
+- 详细上下文包含世界、Actor、资产、文件夹和所选图表节点；集合最多返回 16 项并提供截断标记。
+- 完整编译、插件加载、HTTP 请求与 Python 执行验证通过。
 
 ### 2026-06-09
 
